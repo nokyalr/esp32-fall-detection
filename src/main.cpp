@@ -8,8 +8,8 @@
 #include <TinyGPS++.h>
 #include <HardwareSerial.h>
 
-#define WIFI_SSID "DIMZT_05"
-#define WIFI_PASSWORD "Surabaya"
+#define WIFI_SSID "satu_dua"
+#define WIFI_PASSWORD "satusatu"
 #define FIREBASE_HOST "emergencyfalldetection-725cb-default-rtdb.asia-southeast1.firebasedatabase.app"
 #define FIREBASE_AUTH "wRBzA1N2VoFQrzmEOizH5eWc66HDliiiD3fvWoH5"
 
@@ -24,34 +24,50 @@ const int buzzerPin = 23;
 const int resetButtonPin = 18;
 const int ledPin = 2;
 
-const int dotDuration = 100;
-const int shortPause = dotDuration;
-const int dashDuration = dotDuration * 3;
-const int longPause = dotDuration * 7;
-const unsigned long ledBlinkInterval = 100;
+// ========== PENGATURAN SENSITIVITAS ==========
+const float FALL_SENSITIVITY = 0.65;      // 0-1: semakin besar = semakin sensitif
+const float NORMAL_LOW_MULT = 0.75;       // 0.5-0.8: batas bawah normal
+const float NORMAL_HIGH_MULT = 1.3;      // 1.2-2.0: batas atas normal
+const float VARIANCE_THRESHOLD = 2.5;    // 1.0-4.0: deteksi gerakan tidak teratur, semakin kecil = semakin sensitif
 
-float TH_LOW = 7.0;
-const float alpha = 0.3;
-const unsigned long CALIBRATE_MS = 3000;
-const int MIN_FREEFALL_SAMPLES = 3;
+const int MIN_FREEFALL_SAMPLES = 3;      // 3-15: jatuh (semakin kecil = sensitif)
+const int MIN_ABNORMAL_SAMPLES = 25;     // 5-30: gerakan abnormal
 
+const float alpha = 0.2;                 // 0.1-0.5: smoothing filter
+const unsigned long CALIBRATE_MS = 3000; // waktu kalibrasi awal
+const unsigned long MOVEMENT_CHECK_INTERVAL = 100; // 50-200ms: frekuensi analisis
+
+// Threshold values (akan di-set otomatis saat kalibrasi)
+float TH_NORMAL_LOW = 8.0;    
+float TH_NORMAL_HIGH = 12.0;  
+float TH_FALL = 5.0;
+
+// System states
+enum SystemState {
+  STATE_NORMAL = 0,    // Hijau - gerakan normal
+  STATE_ABNORMAL = 1,  // Kuning - gerakan tidak normal
+  STATE_FALL = 2       // Merah - jatuh (persisten sampai reset)
+};
+
+SystemState currentState = STATE_NORMAL;
+SystemState previousState = STATE_NORMAL;
+
+bool systemReady = false;        // Flag untuk menandakan sistem siap
 bool fallDetected = false;
 bool buttonPressed = false;
 unsigned long lastDebounceTime = 0;
 const unsigned long debounceDelay = 50;
 unsigned long lastLedToggle = 0;
-bool ledState = HIGH;
+bool ledState = LOW;             // Start dengan LED mati
 int fallSampleCount = 0;
+int abnormalSampleCount = 0;
 float emaAccel;
+float emaVariance = 0.0;
 
-// SOS tone handling
-unsigned long sosLastTime = 0;
-int sosStep = 0;
-bool tonePlaying = false;
-unsigned long toneEndTime = 0;
-
-// SOS Morse Code: 1 = dot, 3 = dash, 0 = pause, -1 = done
-int sosSequence[] = {1, 1, 1, 0, 3, 3, 3, 0, 1, 1, 1, 0, -1};
+// Movement analysis variables
+float accelHistory[10] = {0};
+int historyIndex = 0;
+unsigned long lastMovementCheck = 0;
 
 String getFormattedTime()
 {
@@ -62,6 +78,15 @@ String getFormattedTime()
   char buffer[25];
   strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
   return String(buffer);
+}
+
+String getStateString(SystemState state) {
+  switch(state) {
+    case STATE_NORMAL: return "NORMAL";
+    case STATE_ABNORMAL: return "ABNORMAL_MOVEMENT";
+    case STATE_FALL: return "FALL_DETECTED";
+    default: return "UNKNOWN";
+  }
 }
 
 void initWiFi()
@@ -82,7 +107,7 @@ void initFirebase()
   config.signer.tokens.legacy_token = FIREBASE_AUTH;
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
-  Firebase.setBool(fbdo, "/esp32/online", true); // saat ESP32 baru hidup
+  Firebase.setBool(fbdo, "/esp32/online", true);
 }
 
 void initMPU()
@@ -112,14 +137,23 @@ void initMPU()
     delay(20);
   }
   float baseline = sum / count;
-  TH_LOW = baseline * 0.65;
+  
+  // Set thresholds based on baseline menggunakan multiplier
+  TH_FALL = baseline * FALL_SENSITIVITY;           
+  TH_NORMAL_LOW = baseline * NORMAL_LOW_MULT;     
+  TH_NORMAL_HIGH = baseline * NORMAL_HIGH_MULT;
+  
   emaAccel = baseline;
+  emaVariance = 0.0;
 
-  Serial.println("Fall detector ready!");
-  Serial.print("Baseline (1g): ");
-  Serial.println(baseline);
-  Serial.print("TH_LOW: ");
-  Serial.println(TH_LOW);
+  Serial.println("Enhanced fall detector ready!");
+  Serial.print("Baseline (1g): "); Serial.println(baseline);
+  Serial.print("TH_FALL: "); Serial.println(TH_FALL);
+  Serial.print("TH_NORMAL_LOW: "); Serial.println(TH_NORMAL_LOW);
+  Serial.print("TH_NORMAL_HIGH: "); Serial.println(TH_NORMAL_HIGH);
+  
+  // Set system ready flag - LED akan menyala setelah ini
+  systemReady = true;
 }
 
 void initBuzzer()
@@ -137,7 +171,7 @@ void initResetButton()
 void initLED()
 {
   pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, HIGH);
+  digitalWrite(ledPin, LOW);  // Start dengan LED mati
 }
 
 void playTone(int frequency)
@@ -156,6 +190,7 @@ void handleSOS()
 {
   static bool isDash = false;
   static unsigned long lastChange = 0;
+  const int dashDuration = 300;
 
   unsigned long now = millis();
   if (now - lastChange >= (isDash ? dashDuration : 100))
@@ -174,9 +209,61 @@ void handleSOS()
   }
 }
 
-void reportFall()
+float calculateMovementVariability() {
+  if (historyIndex < 5) return 0.0;
+  
+  float mean = 0.0;
+  int samples = min(10, historyIndex);
+  
+  for (int i = 0; i < samples; i++) {
+    mean += accelHistory[i];
+  }
+  mean /= samples;
+  
+  float variance = 0.0;
+  for (int i = 0; i < samples; i++) {
+    variance += pow(accelHistory[i] - mean, 2);
+  }
+  variance /= samples;
+  
+  return sqrt(variance);
+}
+
+SystemState analyzeMovementPattern(float currentAccel, float variance) {
+  // PENTING: Jika sudah fall detected, tetap dalam state fall sampai direset
+  if (currentState == STATE_FALL) {
+    return STATE_FALL;
+  }
+  
+  // Deteksi jatuh (prioritas tertinggi)
+  if (currentAccel < TH_FALL) {
+    fallSampleCount++;
+    if (fallSampleCount >= MIN_FREEFALL_SAMPLES) {
+      return STATE_FALL;
+    }
+  } else {
+    fallSampleCount = 0;
+  }
+  
+  // Deteksi gerakan abnormal
+  bool accelOutOfRange = (currentAccel < TH_NORMAL_LOW) || (currentAccel > TH_NORMAL_HIGH);
+  bool highVariability = variance > VARIANCE_THRESHOLD;
+  
+  if (accelOutOfRange || highVariability) {
+    abnormalSampleCount++;
+    if (abnormalSampleCount >= MIN_ABNORMAL_SAMPLES) {
+      return STATE_ABNORMAL;
+    }
+  } else {
+    abnormalSampleCount = max(0, abnormalSampleCount - 2);
+  }
+  
+  return STATE_NORMAL;
+}
+
+void reportStatus()
 {
-  String status = "FALL DETECTED";
+  String status = getStateString(currentState);
   String timestamp = getFormattedTime();
   float latitude = 0.0;
   float longitude = 0.0;
@@ -186,38 +273,46 @@ void reportFall()
     latitude = gps.location.lat();
     longitude = gps.location.lng();
   }
-  else
-  {
-    Serial.println("Using last known location (GPS not available)");
-  }
 
   bool ok = true;
   ok &= Firebase.setString(fbdo, "/fall_detection/status", status);
   ok &= Firebase.setString(fbdo, "/fall_detection/timestamp", timestamp);
   ok &= Firebase.setFloat(fbdo, "/fall_detection/location/lat", latitude);
   ok &= Firebase.setFloat(fbdo, "/fall_detection/location/lon", longitude);
+  ok &= Firebase.setInt(fbdo, "/fall_detection/state_code", (int)currentState);
+  ok &= Firebase.setFloat(fbdo, "/fall_detection/accel_magnitude", emaAccel);
+  ok &= Firebase.setFloat(fbdo, "/fall_detection/movement_variance", emaVariance);
 
   if (ok)
   {
-    Serial.println("✅ Fall event reported to Firebase!");
+    Serial.printf("✅ Status reported: %s\n", status.c_str());
   }
   else
   {
-    Serial.print("❌ Error reporting fall: ");
+    Serial.print("❌ Error reporting status: ");
     Serial.println(fbdo.errorReason());
   }
 }
 
 void resetSystem()
 {
+  currentState = STATE_NORMAL;
+  previousState = STATE_NORMAL;
   fallDetected = false;
   fallSampleCount = 0;
-  emaAccel = TH_LOW * 1.5;
+  abnormalSampleCount = 0;
+  emaAccel = (TH_NORMAL_LOW + TH_NORMAL_HIGH) / 2;
+  emaVariance = 0.0;
   ledcWriteTone(0, 0);
-  digitalWrite(ledPin, HIGH);
-  sosStep = 0;
-  toneEndTime = 0;
+  
+  // Reset history buffer
+  for (int i = 0; i < 10; i++) {
+    accelHistory[i] = 0.0;
+  }
+  historyIndex = 0;
+  
   Serial.println("System reset - ready for new detection");
+  reportStatus(); // Report reset status
 }
 
 void checkResetButton()
@@ -240,33 +335,57 @@ void checkResetButton()
 
 void handleLED()
 {
-  if (fallDetected)
-  {
-    if (millis() - lastLedToggle > ledBlinkInterval)
-    {
-      lastLedToggle = millis();
-      ledState = !ledState;
-      digitalWrite(ledPin, ledState);
-    }
+  // LED hanya menyala jika sistem sudah ready (WiFi connected & calibrated)
+  if (!systemReady) {
+    digitalWrite(ledPin, LOW);  // LED mati jika belum ready
+    return;
   }
-  else
-  {
-    digitalWrite(ledPin, HIGH);
+  
+  switch(currentState) {
+    case STATE_NORMAL:
+      digitalWrite(ledPin, HIGH);  // LED menyala terus (hijau)
+      break;
+      
+    case STATE_ABNORMAL:
+      // Blink lambat untuk status kuning
+      if (millis() - lastLedToggle > 500) {
+        lastLedToggle = millis();
+        ledState = !ledState;
+        digitalWrite(ledPin, ledState);
+      }
+      break;
+      
+    case STATE_FALL:
+      // Blink cepat untuk status merah
+      if (millis() - lastLedToggle > 100) {
+        lastLedToggle = millis();
+        ledState = !ledState;
+        digitalWrite(ledPin, ledState);
+      }
+      break;
   }
 }
 
-void printGPSLocation()
-{
-  if (gps.location.isValid())
-  {
-    Serial.print("Latitude: ");
-    Serial.println(gps.location.lat(), 6);
-    Serial.print("Longitude: ");
-    Serial.println(gps.location.lng(), 6);
-  }
-  else
-  {
-    Serial.println("GPS location not available");
+void handleBuzzer() {
+  switch(currentState) {
+    case STATE_NORMAL:
+      playTone(0);  // Tidak ada suara
+      break;
+      
+    case STATE_ABNORMAL:
+      // Beep singkat setiap 2 detik
+      static unsigned long lastAbnormalBeep = 0;
+      if (millis() - lastAbnormalBeep > 2000) {
+        lastAbnormalBeep = millis();
+        playTone(600);
+        delay(100);
+        playTone(0);
+      }
+      break;
+      
+    case STATE_FALL:
+      handleSOS();  // SOS pattern
+      break;
   }
 }
 
@@ -274,68 +393,98 @@ void setup()
 {
   Serial.begin(115200);
   gpsSerial.begin(9600, SERIAL_8N1, 16, 17);
-  initWiFi();
+  
+  initLED();        // LED mati dulu
   initBuzzer();
   initResetButton();
-  initLED();
+  
+  Serial.println("Initializing system...");
+  initWiFi();       // Connect ke WiFi
+  
   configTime(7 * 3600, 0, "pool.ntp.org");
   delay(1000);
-  initFirebase();
-  initMPU();
+  initFirebase();   // Connect ke Firebase
+  
+  initMPU();        // Kalibrasi & set systemReady = true
+  
+  Serial.println("✅ System fully initialized and ready!");
 }
-
-unsigned long lastHeartbeat = 0;
 
 void loop()
 {
   checkResetButton();
   handleLED();
 
-  if (!fallDetected)
-  {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-    float mag = sqrt(
-        a.acceleration.x * a.acceleration.x +
-        a.acceleration.y * a.acceleration.y +
-        a.acceleration.z * a.acceleration.z);
-    emaAccel = alpha * mag + (1 - alpha) * emaAccel;
+  // Hanya proses sensor jika sistem sudah ready
+  if (!systemReady) {
+    delay(100);
+    return;
+  }
 
-    if (emaAccel < TH_LOW)
-    {
-      fallSampleCount++;
-      if (fallSampleCount >= MIN_FREEFALL_SAMPLES)
-      {
+  // Baca sensor MPU6050
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  float mag = sqrt(
+      a.acceleration.x * a.acceleration.x +
+      a.acceleration.y * a.acceleration.y +
+      a.acceleration.z * a.acceleration.z);
+  
+  // Update EMA
+  emaAccel = alpha * mag + (1 - alpha) * emaAccel;
+  
+  // Update history buffer untuk analisis pola
+  if (millis() - lastMovementCheck > MOVEMENT_CHECK_INTERVAL) {
+    lastMovementCheck = millis();
+    
+    accelHistory[historyIndex % 10] = emaAccel;
+    historyIndex++;
+    
+    // Hitung variabilitas gerakan
+    emaVariance = calculateMovementVariability();
+    
+    // Analisis pola gerakan dan tentukan state
+    previousState = currentState;
+    currentState = analyzeMovementPattern(emaAccel, emaVariance);
+    
+    // Log perubahan state
+    if (currentState != previousState) {
+      Serial.printf("State changed: %s -> %s\n", 
+                   getStateString(previousState).c_str(), 
+                   getStateString(currentState).c_str());
+      
+      if (currentState == STATE_FALL) {
+        Serial.println("🚨 FALL DETECTED! System locked in fall state until reset.");
+        if (gps.location.isValid()) {
+          Serial.printf("Location: %.6f, %.6f\n", gps.location.lat(), gps.location.lng());
+        }
         fallDetected = true;
-        Serial.println("Fall detected");
-        printGPSLocation();
-        reportFall();
-        lastLedToggle = millis();
+      } else if (currentState == STATE_ABNORMAL) {
+        Serial.println("⚠️ ABNORMAL MOVEMENT DETECTED");
+      } else {
+        Serial.println("✅ Movement normalized");
       }
-    }
-    else
-    {
-      fallSampleCount = 0;
+      
+      reportStatus();  // Report immediately on state change
     }
   }
 
+  // Handle GPS
   while (gpsSerial.available() > 0)
   {
     char c = gpsSerial.read();
     gps.encode(c);
   }
 
-  if (fallDetected)
-  {
-    handleSOS();
-  }
+  // Handle buzzer based on current state
+  handleBuzzer();
 
-  // Heartbeat - kirim data walaupun tidak jatuh
-  if (Firebase.ready() && (millis() - lastHeartbeat > 5000)) // setiap 5 detik
+  // Heartbeat - kirim data secara berkala (setiap 5 detik)
+  static unsigned long lastHeartbeat = 0;
+  if (Firebase.ready() && (millis() - lastHeartbeat > 5000))
   {
     lastHeartbeat = millis();
 
-    String status = fallDetected ? "FALL DETECTED" : "Normal";
+    String status = getStateString(currentState);
     String timestamp = getFormattedTime();
     float latitude = 0.0;
     float longitude = 0.0;
@@ -346,7 +495,7 @@ void loop()
       longitude = gps.location.lng();
     }
 
-    time_t now = time(NULL); // waktu epoch sekarang
+    time_t now = time(NULL);
 
     bool ok = true;
     ok &= Firebase.setString(fbdo, "/fall_detection/status", status);
@@ -355,6 +504,9 @@ void loop()
     ok &= Firebase.setFloat(fbdo, "/fall_detection/location/lon", longitude);
     ok &= Firebase.setBool(fbdo, "/esp32/online", true);
     ok &= Firebase.setInt(fbdo, "/esp32/last_seen", now);
+    ok &= Firebase.setInt(fbdo, "/fall_detection/state_code", (int)currentState);
+    ok &= Firebase.setFloat(fbdo, "/fall_detection/accel_magnitude", emaAccel);
+    ok &= Firebase.setFloat(fbdo, "/fall_detection/movement_variance", emaVariance);
 
     if (!ok)
     {
@@ -363,7 +515,8 @@ void loop()
     }
     else
     {
-      Serial.println("📡 Heartbeat Firebase update");
+      Serial.printf("📡 Heartbeat: %s (Accel: %.2f, Var: %.2f)\n", 
+                   status.c_str(), emaAccel, emaVariance);
     }
   }
 }
