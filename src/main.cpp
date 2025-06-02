@@ -1,5 +1,6 @@
 #include <WiFi.h>
-#include <FirebaseESP32.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 #include <time.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
@@ -8,29 +9,42 @@
 #include <TinyGPS++.h>
 #include <HardwareSerial.h>
 
+// WiFi Configuration
 #define WIFI_SSID "satu_dua"
 #define WIFI_PASSWORD "satusatu"
-#define FIREBASE_HOST "emergencyfalldetection-725cb-default-rtdb.asia-southeast1.firebasedatabase.app"
-#define FIREBASE_AUTH "wRBzA1N2VoFQrzmEOizH5eWc66HDliiiD3fvWoH5"
+
+// MQTT Configuration
+#define MQTT_SERVER "broker.hivemq.com"  // Ganti dengan broker MQTT Anda
+#define MQTT_PORT 1883
+#define MQTT_CLIENT_ID "ESP32_FallDetector_001"
+#define MQTT_USERNAME ""  // Kosongkan jika tidak perlu
+#define MQTT_PASSWORD ""  // Kosongkan jika tidak perlu
+
+// MQTT Topics
+#define TOPIC_STATUS "falldetection/status"
+#define TOPIC_LOCATION "falldetection/location"
+#define TOPIC_HEARTBEAT "falldetection/heartbeat"
+#define TOPIC_ALERT "falldetection/alert"
+#define TOPIC_RESET "falldetection/reset"
 
 Adafruit_MPU6050 mpu;
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(1);
-FirebaseData fbdo;
-FirebaseAuth auth;
-FirebaseConfig config;
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 
 const int buzzerPin = 23;
 const int resetButtonPin = 18;
 const int ledPin = 2;
 
 // ========== PENGATURAN SENSITIVITAS ==========
-const float FALL_SENSITIVITY = 0.65;      // 0-1: semakin besar = semakin sensitif
+const float FALL_SENSITIVITY = 0.5;      // 0-1: semakin besar = semakin sensitif
 const float NORMAL_LOW_MULT = 0.75;       // 0.5-0.8: batas bawah normal
 const float NORMAL_HIGH_MULT = 1.3;      // 1.2-2.0: batas atas normal
-const float VARIANCE_THRESHOLD = 2.5;    // 1.0-4.0: deteksi gerakan tidak teratur, semakin kecil = semakin sensitif
+const float VARIANCE_THRESHOLD = 2;    // 1.0-4.0: deteksi gerakan tidak teratur, semakin kecil = semakin sensitif
 
-const int MIN_FREEFALL_SAMPLES = 3;      // 3-15: jatuh (semakin kecil = sensitif)
+const int MIN_FREEFALL_SAMPLES = 4;      // 3-15: jatuh (semakin kecil = sensitif)
 const int MIN_ABNORMAL_SAMPLES = 25;     // 5-30: gerakan abnormal
 
 const float alpha = 0.2;                 // 0.1-0.5: smoothing filter
@@ -68,6 +82,7 @@ float emaVariance = 0.0;
 float accelHistory[10] = {0};
 int historyIndex = 0;
 unsigned long lastMovementCheck = 0;
+unsigned long lastMqttReconnect = 0;
 
 String getFormattedTime()
 {
@@ -99,15 +114,147 @@ void initWiFi()
     delay(500);
   }
   Serial.println("\nConnected to WiFi!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
 }
 
-void initFirebase()
-{
-  config.host = FIREBASE_HOST;
-  config.signer.tokens.legacy_token = FIREBASE_AUTH;
-  Firebase.begin(&config, &auth);
-  Firebase.reconnectWiFi(true);
-  Firebase.setBool(fbdo, "/esp32/online", true);
+// Function prototype for resetSystem
+void resetSystem();
+
+// Function prototype for connectMQTT
+void connectMQTT();
+
+// Function prototype for publishStatus
+void publishStatus(String status, bool immediate = false);
+
+// Function prototype for publishAlert
+void publishAlert();
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  Serial.printf("MQTT message received [%s]: %s\n", topic, message.c_str());
+  
+  // Handle reset command
+  if (String(topic) == TOPIC_RESET && message == "RESET") {
+    Serial.println("Remote reset command received");
+    resetSystem();
+  }
+}
+
+void initMQTT() {
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setKeepAlive(60);
+  
+  connectMQTT();
+}
+
+void connectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    
+    if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD)) {
+      Serial.println(" connected!");
+      
+      // Subscribe to reset topic
+      mqttClient.subscribe(TOPIC_RESET);
+      
+      // Send online status
+      publishStatus("ONLINE", true);
+      
+    } else {
+      Serial.print(" failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+void publishStatus(String status, bool immediate) {
+  if (!mqttClient.connected()) {
+    if (millis() - lastMqttReconnect > 5000) {
+      lastMqttReconnect = millis();
+      connectMQTT();
+    }
+    return;
+  }
+
+  DynamicJsonDocument doc(512);
+  doc["device_id"] = MQTT_CLIENT_ID;
+  doc["status"] = status;
+  doc["timestamp"] = getFormattedTime();
+  doc["state_code"] = (int)currentState;
+  doc["accel_magnitude"] = emaAccel;
+  doc["movement_variance"] = emaVariance;
+  doc["uptime"] = millis();
+  
+  // Add GPS location if available
+  if (gps.location.isValid()) {
+    doc["location"]["lat"] = gps.location.lat();
+    doc["location"]["lon"] = gps.location.lng();
+    doc["location"]["valid"] = true;
+  } else {
+    doc["location"]["valid"] = false;
+  }
+
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  bool published = mqttClient.publish(TOPIC_STATUS, jsonString.c_str(), true); // retained message
+  
+  if (published) {
+    Serial.printf("✅ Status published: %s\n", status.c_str());
+  } else {
+    Serial.println("❌ Failed to publish status");
+  }
+  
+  // Send alert for fall detection
+  if (currentState == STATE_FALL && immediate) {
+    publishAlert();
+  }
+}
+
+void publishAlert() {
+  if (!mqttClient.connected()) return;
+
+  DynamicJsonDocument alertDoc(256);
+  alertDoc["device_id"] = MQTT_CLIENT_ID;
+  alertDoc["alert_type"] = "FALL_DETECTED";
+  alertDoc["timestamp"] = getFormattedTime();
+  alertDoc["severity"] = "HIGH";
+  
+  if (gps.location.isValid()) {
+    alertDoc["location"]["lat"] = gps.location.lat();
+    alertDoc["location"]["lon"] = gps.location.lng();
+  }
+
+  String alertJson;
+  serializeJson(alertDoc, alertJson);
+  
+  mqttClient.publish(TOPIC_ALERT, alertJson.c_str(), true);
+  Serial.println("🚨 FALL ALERT published to MQTT");
+}
+
+void publishHeartbeat() {
+  if (!mqttClient.connected()) return;
+
+  DynamicJsonDocument heartbeatDoc(256);
+  heartbeatDoc["device_id"] = MQTT_CLIENT_ID;
+  heartbeatDoc["timestamp"] = getFormattedTime();
+  heartbeatDoc["uptime"] = millis();
+  heartbeatDoc["free_heap"] = ESP.getFreeHeap();
+  heartbeatDoc["wifi_rssi"] = WiFi.RSSI();
+  heartbeatDoc["status"] = getStateString(currentState);
+
+  String heartbeatJson;
+  serializeJson(heartbeatDoc, heartbeatJson);
+  
+  mqttClient.publish(TOPIC_HEARTBEAT, heartbeatJson.c_str());
 }
 
 void initMPU()
@@ -261,39 +408,6 @@ SystemState analyzeMovementPattern(float currentAccel, float variance) {
   return STATE_NORMAL;
 }
 
-void reportStatus()
-{
-  String status = getStateString(currentState);
-  String timestamp = getFormattedTime();
-  float latitude = 0.0;
-  float longitude = 0.0;
-
-  if (gps.location.isValid())
-  {
-    latitude = gps.location.lat();
-    longitude = gps.location.lng();
-  }
-
-  bool ok = true;
-  ok &= Firebase.setString(fbdo, "/fall_detection/status", status);
-  ok &= Firebase.setString(fbdo, "/fall_detection/timestamp", timestamp);
-  ok &= Firebase.setFloat(fbdo, "/fall_detection/location/lat", latitude);
-  ok &= Firebase.setFloat(fbdo, "/fall_detection/location/lon", longitude);
-  ok &= Firebase.setInt(fbdo, "/fall_detection/state_code", (int)currentState);
-  ok &= Firebase.setFloat(fbdo, "/fall_detection/accel_magnitude", emaAccel);
-  ok &= Firebase.setFloat(fbdo, "/fall_detection/movement_variance", emaVariance);
-
-  if (ok)
-  {
-    Serial.printf("✅ Status reported: %s\n", status.c_str());
-  }
-  else
-  {
-    Serial.print("❌ Error reporting status: ");
-    Serial.println(fbdo.errorReason());
-  }
-}
-
 void resetSystem()
 {
   currentState = STATE_NORMAL;
@@ -312,7 +426,7 @@ void resetSystem()
   historyIndex = 0;
   
   Serial.println("System reset - ready for new detection");
-  reportStatus(); // Report reset status
+  publishStatus("RESET", true); // Report reset status
 }
 
 void checkResetButton()
@@ -403,8 +517,8 @@ void setup()
   
   configTime(7 * 3600, 0, "pool.ntp.org");
   delay(1000);
-  initFirebase();   // Connect ke Firebase
   
+  initMQTT();       // Connect ke MQTT Broker
   initMPU();        // Kalibrasi & set systemReady = true
   
   Serial.println("✅ System fully initialized and ready!");
@@ -412,6 +526,15 @@ void setup()
 
 void loop()
 {
+  // Maintain MQTT connection
+  if (!mqttClient.connected()) {
+    if (millis() - lastMqttReconnect > 5000) {
+      lastMqttReconnect = millis();
+      connectMQTT();
+    }
+  }
+  mqttClient.loop();
+
   checkResetButton();
   handleLED();
 
@@ -464,7 +587,7 @@ void loop()
         Serial.println("✅ Movement normalized");
       }
       
-      reportStatus();  // Report immediately on state change
+      publishStatus(getStateString(currentState), true);  // Report immediately on state change
     }
   }
 
@@ -480,43 +603,14 @@ void loop()
 
   // Heartbeat - kirim data secara berkala (setiap 5 detik)
   static unsigned long lastHeartbeat = 0;
-  if (Firebase.ready() && (millis() - lastHeartbeat > 5000))
+  if (millis() - lastHeartbeat > 5000)
   {
     lastHeartbeat = millis();
-
-    String status = getStateString(currentState);
-    String timestamp = getFormattedTime();
-    float latitude = 0.0;
-    float longitude = 0.0;
-
-    if (gps.location.isValid())
-    {
-      latitude = gps.location.lat();
-      longitude = gps.location.lng();
-    }
-
-    time_t now = time(NULL);
-
-    bool ok = true;
-    ok &= Firebase.setString(fbdo, "/fall_detection/status", status);
-    ok &= Firebase.setString(fbdo, "/fall_detection/timestamp", timestamp);
-    ok &= Firebase.setFloat(fbdo, "/fall_detection/location/lat", latitude);
-    ok &= Firebase.setFloat(fbdo, "/fall_detection/location/lon", longitude);
-    ok &= Firebase.setBool(fbdo, "/esp32/online", true);
-    ok &= Firebase.setInt(fbdo, "/esp32/last_seen", now);
-    ok &= Firebase.setInt(fbdo, "/fall_detection/state_code", (int)currentState);
-    ok &= Firebase.setFloat(fbdo, "/fall_detection/accel_magnitude", emaAccel);
-    ok &= Firebase.setFloat(fbdo, "/fall_detection/movement_variance", emaVariance);
-
-    if (!ok)
-    {
-      Serial.print("⚠️ Heartbeat gagal: ");
-      Serial.println(fbdo.errorReason());
-    }
-    else
-    {
-      Serial.printf("📡 Heartbeat: %s (Accel: %.2f, Var: %.2f)\n", 
-                   status.c_str(), emaAccel, emaVariance);
-    }
+    publishHeartbeat();
+    
+    Serial.printf("📡 Heartbeat: %s (Accel: %.2f, Var: %.2f)\n", 
+                 getStateString(currentState).c_str(), emaAccel, emaVariance);
   }
+
+  delay(10); // Small delay to prevent watchdog reset
 }
