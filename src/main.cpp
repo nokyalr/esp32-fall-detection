@@ -21,14 +21,14 @@ FirebaseAuth auth;
 FirebaseConfig config;
 
 const int buzzerPin = 23;
-const int resetButtonPin = 18;
+const int resetButtonPin = 12;
 const int ledPin = 2;
 
 // ========== PENGATURAN SENSITIVITAS ==========
-const float FALL_SENSITIVITY = 0.65;      // 0-1: semakin besar = semakin sensitif
+const float FALL_SENSITIVITY = 0.6;      // 0-1: semakin besar = semakin sensitif
 const float NORMAL_LOW_MULT = 0.75;       // 0.5-0.8: batas bawah normal
 const float NORMAL_HIGH_MULT = 1.3;      // 1.2-2.0: batas atas normal
-const float VARIANCE_THRESHOLD = 2.5;    // 1.0-4.0: deteksi gerakan tidak teratur, semakin kecil = semakin sensitif
+const float VARIANCE_THRESHOLD = 2;    // 1.0-4.0: deteksi gerakan tidak teratur, semakin kecil = semakin sensitif
 
 const int MIN_FREEFALL_SAMPLES = 3;      // 3-15: jatuh (semakin kecil = sensitif)
 const int MIN_ABNORMAL_SAMPLES = 25;     // 5-30: gerakan abnormal
